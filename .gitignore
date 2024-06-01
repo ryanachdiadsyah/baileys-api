@@ -7,3 +7,4 @@ prisma/migrations/
 .DS_Store
 *.tgz
 *.log
+.env.example

@@ -1,5 +1,6 @@
 import makeWASocket, {
 	DisconnectReason,
+	downloadMediaMessage,
 	isJidBroadcast,
 	makeCacheableSignalKeyStore,
 } from "@whiskeysockets/baileys";
@@ -13,6 +14,7 @@ import type { Response } from "express";
 import { toDataURL } from "qrcode";
 import { delay } from "./utils";
 import dotenv from "dotenv";
+import { callWebHook, callWebHookFile } from "./fetch";
 
 dotenv.config();
 
@@ -68,7 +70,7 @@ export async function createSession(options: createSessionOptions) {
 
 	const destroy = async (logout = true) => {
 		try {
-			await Promise.all([
+			await Promise.allSettled([
 				logout && socket.logout(),
 				prisma.chat.deleteMany({ where: { sessionId } }),
 				prisma.contact.deleteMany({ where: { sessionId } }),
@@ -190,11 +192,79 @@ export async function createSession(options: createSessionOptions) {
 		});
 	}
 
-	// Debug events
-	// socket.ev.on("messaging-history.set", (data) => dump("messaging-history.set", data));
-	// socket.ev.on("chats.upsert", (data) => dump("chats.upsert", data));
-	// socket.ev.on("contacts.update", (data) => dump("contacts.update", data));
-	// socket.ev.on("groups.upsert", (data) => dump("groups.upsert", data));
+	// Aquí manejamos el envío del mensaje recibido a múltiples webhooks
+	socket.ev.on("messages.upsert", async (m) => {
+		const message = m.messages[0];
+		if (!m.messages || !message.message) return;
+
+		// Tipos de mensajes de texto y documentos
+		const textMessageTypes = [
+			"conversation",
+			"extendedTextMessage",
+			//"messageContextInfo",
+			"buttonsResponseMessage",
+			"listResponseMessage",
+			"contactMessage",
+			"locationMessage",
+			"liveLocationMessage",
+		];
+		const documentMessageTypes = ["imageMessage", "documentMessage", "audioMessage"];
+
+		// Encontrar el primer tipo de mensaje válido que sea de texto o documento
+		const messageType = Object.keys(message.message).find(
+			(value) =>
+				textMessageTypes.includes(value as keyof typeof message.message) ||
+				documentMessageTypes.includes(value as keyof typeof message.message),
+		) as keyof typeof message.message | undefined;
+
+		// Si no es un mensaje válido, devolver
+		if (!messageType) return;
+
+		// Extraer el contenido del mensaje
+		const messageContent = message.message[messageType];
+
+		try {
+			const webhooks = await prisma.webhook.findMany({ where: { sessionId } });
+
+			const webhookPromises = webhooks.map(async (webhook) => {
+				if (textMessageTypes.includes(messageType)) {
+					return callWebHook(webhook.url, {
+						message,
+						messageContent,
+						messageType,
+						session: sessionId,
+						type: "text",
+					});
+				} else if (documentMessageTypes.includes(messageType)) {
+					const buffer = await downloadMediaMessage(
+						message,
+						"buffer",
+						{},
+						{
+							logger,
+							reuploadRequest: socket.updateMediaMessage,
+						},
+					);
+					return callWebHookFile(
+						webhook.url,
+						{
+							message,
+							messageContent,
+							messageType,
+							session: sessionId,
+							type: "file",
+						},
+						buffer,
+					);
+				}
+			});
+
+			await Promise.allSettled(webhookPromises);
+			logger.info("Message sent to webhooks");
+		} catch (error) {
+			logger.error(error, "Failed to send message to webhooks");
+		}
+	});
 
 	await prisma.session.upsert({
 		create: {
